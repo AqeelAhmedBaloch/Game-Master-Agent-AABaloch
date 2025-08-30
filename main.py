@@ -1,125 +1,103 @@
 import os
-import random
-from dotenv import load_dotenv
 import chainlit as cl
+from typing import cast
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from agents import (Agent, Runner, OpenAIChatCompletionsModel, set_tracing_disabled, set_default_openai_api)
+from agents import Agent, Runner, RunConfig,handoff, OpenAIChatCompletionsModel, RunContextWrapper
 
-# ---------------- Env & SDK setup ---------------- #
+
 load_dotenv()
 
-# If you don't have an OpenAI key (using Gemini/OpenAI-compatible proxy), disable tracing.
-set_tracing_disabled(True)
+# 🛠 Define tools using Agentic AI SDK's @tool decorator
 
-# Many non-OpenAI providers don't support Responses API — force Chat Completions shape globally.
-# (We're also explicitly using OpenAIChatCompletionsModel below.)
-set_default_openai_api("chat_completions")
-
-# Configure Gemini (OpenAI-compatible) client
-client = AsyncOpenAI(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    base_url=os.getenv("BASE_URL"),
-)
-
-# Single model adapter to reuse on agents
-model_adapter = OpenAIChatCompletionsModel(
-    model="gemini-2.5-flash",
-    openai_client=client,
-)
-
-# ---------------- Simple local tools ---------------- #
-def roll_dice():
-    return f"🎲 You rolled a {random.randint(1, 6)}!"
-
-def generate_event():
-    events = [
-        "🌪️ A sudden storm surrounds you!",
-        "🧟 A zombie crawls out of the ground!",
-        "💎 You spot a mysterious glowing gem!",
-        "🦴 A skeleton warrior blocks your path!",
-    ]
-    return random.choice(events)
-
-# ---------------- Agents ---------------- #
-narrator_agent = Agent(
-    name="Narrator",
-    instructions=(
-        "You are the Narrator Agent. Describe the world, respond to player choices, "
-        "and guide the adventure. Stay in character, build suspense, and ask questions "
-        "to drive the story forward."
-    ),
-    model=model_adapter,
-)
-
-monster_agent = Agent(
-    name="Monster",
-    instructions=(
-        "You are the Monster Agent. Engage the player in combat: describe enemies, "
-        "attack moves, and let the player defend/attack. Stay in the combat phase "
-        "until the player defeats or flees."
-    ),
-    model=model_adapter,
-)
-
-item_agent = Agent(
-    name="Item Master",
-    instructions=(
-        "You are the Item Agent. Manage inventory, generate loot, assign weapons or "
-        "healing items, and describe magical artifacts."
-    ),
-    model=model_adapter,
-)
-
-triage_agent = Agent(
-    name="Triage Agent",
-    instructions=(
-        "Decide the correct agent for the user's input:\n"
-        "- If it is about combat (attack/fight/run/monster), handoff to the Monster agent.\n"
-        "- If it is about loot/items/inventory/chest/reward, handoff to the Item Master.\n"
-        "- Otherwise, handoff to the Narrator.\n"
-        "After handoff, the delegated agent should produce the final response."
-    ),
-    handoffs=[narrator_agent, monster_agent, item_agent],
-    model=model_adapter,
-)
-
-# ---------------- Story Intro ---------------- #
-def intro_story():
-    return (
-        "You stand at the edge of the haunted Everdark Forest.\n"
-        "Type `roll` to roll a dice, `event` to trigger a random event, "
-        "or begin your journey (e.g., 'go north', 'fight', 'search chest')."
+def setup_config():
+    # External Client
+    external_client = AsyncOpenAI(
+        api_key=os.getenv("GEMINI_API_KEY"),
+        base_url=os.getenv("BASE_URL"),
     )
 
-# ---------------- Chainlit Hooks ---------------- #
+    model = OpenAIChatCompletionsModel(
+        model="gemini-1.5-flash",
+        openai_client=external_client,
+    )
+
+    config = RunConfig(
+        model=model,
+        model_provider=external_client, 
+        tracing_disabled=True
+        )
+
+    # 🎭 Agents
+    narrator_agent = Agent(
+        name="narrator_agent",
+        instructions="You narrate the adventure and guide the player through the story.",
+        handoff_description="Handles story narration and progress.",
+        model=model
+    )
+
+    monster_agent = Agent(
+        name="monster_agent",
+        instructions="You control monsters during combat, describe attacks and outcomes.",
+        handoff_description="Handles combat scenarios with enemies.",
+        model=model
+    )
+
+    item_agent = Agent(
+        name="item_agent",
+        instructions="You manage inventory, give rewards, and describe found items.",
+        handoff_description="Handles items, treasures, and inventory events.",
+        model=model
+    )
+
+    # 🎮 Game Master Agent (triage)
+    triage_agent = Agent(
+        name="triage_agent",
+        instructions=(
+            "You are the Game Master of a fantasy adventure. Use the given tools to roll dice and "
+            "generate random events. Dynamically hand off control to the relevant agent based on "
+            "the game phase (narration, combat, inventory)."
+        ),
+        handoffs=[
+                  (item_agent),
+                  (monster_agent),
+                  (narrator_agent)
+                ],
+        model=model
+    )
+
+    return triage_agent, config
+
+
 @cl.on_chat_start
 async def start():
-    await cl.Message("🎮 Welcome to the **Game Master Adventure** by Aqeel Ahmed Baloch!").send()
-    await cl.Message(intro_story()).send()
+    triage_agent, config = setup_config()
+    cl.user_session.set("triage_agent", triage_agent)
+    cl.user_session.set("config", config)
+    cl.user_session.set("chat_history", [])
+    await cl.Message(content="🎮 Welcome to the Fantasy Adventure Game! Type 'start' to begin your quest.").send()
 
 @cl.on_message
-async def handle_message(msg: cl.Message):
-    user_input = msg.content.strip()
+async def main(message: cl.Message):
+    """Main handler for incoming messages."""
+    msg = cl.Message(content="🎲 Thinking...")
+    await msg.send()
 
-    try:
-        if user_input.lower() in {"hi", "hello", "hey"}:
-            await cl.Message(intro_story()).send()
-            return
+    triage_agent = cast(Agent, cl.user_session.get("triage_agent"))
+    config = cast(RunConfig, cl.user_session.get("config"))
+    history = cl.user_session.get("chat_history") or []
 
-        if user_input.lower() == "roll":
-            await cl.Message(roll_dice()).send()
-            return
+    history.append({"role": "user", "content": message.content})
 
-        if user_input.lower() == "event":
-            await cl.Message(generate_event()).send()
-            return
+    # 🏹 Run the Triage Agent
+    result = await Runner.run(triage_agent, history, run_config=config)
 
-        # ✅ Run the workflow starting from triage_agent; handoffs are automatic.
-        result = await Runner.run(triage_agent, input=user_input)
+    response_content = result.final_output
+    msg.content = response_content
+    await msg.update()
 
-        # result.final_output is the final text from the last agent in the chain.
-        output_text = result.final_output or "✅ Done."
-        await cl.Message(output_text).send()
+    history.append({"role": "assistant", "content": response_content})
+    cl.user_session.set("chat_history", history)
 
-    except Exception as e:
-        await cl.Message(f"❌ Error:\n{str(e)}").send()
+    print(f"Chat history: {history}")  # Debugging line to check chat history
+    
